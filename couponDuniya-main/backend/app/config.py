@@ -1,13 +1,14 @@
+import os
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
 class Settings(BaseSettings):
     APP_NAME: str = "CouponAli API"
+    APP_ENV: str = "development"
     DEBUG: bool = True
-    # PostgreSQL database connection
-    DATABASE_URL: str = "postgresql+psycopg://coupon:hardik123@127.0.0.1:5432/couponali"
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+psycopg://localhost:5432/couponali")
     REDIS_URL: str = "redis://localhost:6379"
-    SECRET_KEY: str = "dev-secret"
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     CORS_ORIGINS: str = "http://localhost:3000"
@@ -29,8 +30,7 @@ class Settings(BaseSettings):
     FACEBOOK_APP_ID: str = ""
     FACEBOOK_APP_SECRET: str = ""
     
-    # Frontend URL for redirects
-    FRONTEND_URL: str = "https://dafc9188-a0bd-4022-aeb0-e4fcf20f899a-00-33uno060mq1q6.picard.replit.dev"
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", f"https://{os.getenv('REPLIT_DEV_DOMAIN', 'localhost:5000')}")
     
     # Razorpay Payment Gateway
     RAZORPAY_KEY_ID: str = "rzp_test_Rp3sBYQKRm8xxB"
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     ADMITAD_TOKEN: str = ""  # OAuth token for Admitad API
     VCOMMISSION_API_KEY: str = ""
     CUELINKS_API_KEY: str = ""
-    FRONTEND_BASE_URL: str = "http://localhost:3000"
+    FRONTEND_BASE_URL: str = os.getenv("FRONTEND_BASE_URL", f"https://{os.getenv('REPLIT_DEV_DOMAIN', 'localhost:5000')}")
     ADMIN_IP_WHITELIST: str = ""  # Comma-separated list of allowed IPs for admin endpoints
     SENTRY_DSN: str = ""
     SENTRY_ENVIRONMENT: str = "development"
