@@ -74,8 +74,8 @@ export function Footer() {
           <div>
             <h3 className="font-semibold mb-4">Popular Categories</h3>
             <ul className="space-y-2 text-sm">
-              {CATEGORIES.slice(0, 6).map((category) => (
-                <li key={category.id}>
+              {CATEGORIES.slice(0, 6).map((category, index) => (
+                <li key={`category-${category.id || category.slug || index}`}>
                   <Link
                     href={`${ROUTES.coupons}?category=${category.slug}`}
                     className="text-muted-foreground hover:text-primary"
