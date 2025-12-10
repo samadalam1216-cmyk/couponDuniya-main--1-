@@ -1,0 +1,206 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { useAuthStore } from "@/store/authStore";
+import { ROUTES } from "@/lib/constants";
+import type { LoginCredentials } from "@/types";
+import apiClient from "@/lib/api-client";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const { login, isLoading, error, setError, clearError, user, isAuthenticated } = useAuthStore();
+  const [showPassword, setShowPassword] = useState(false);
+  const [googleError, setGoogleError] = useState<string | null>(null); // State for Google login errors
+
+  // Redirect if already logged in - but wait for proper hydration
+  useEffect(() => {
+    // Wait a bit for store to hydrate
+    const timer = setTimeout(() => {
+      if (isAuthenticated && user) {
+        const isAdmin = user.is_admin === true || user.role === 'admin';
+        const redirectUrl = isAdmin ? '/admin/dashboard' : '/';
+
+        console.log('✅ Already authenticated, redirecting to:', redirectUrl, { isAdmin });
+        router.replace(redirectUrl);
+      }
+    }, 1000); // 1 second delay to ensure store is hydrated
+
+    return () => clearTimeout(timer);
+  }, [isAuthenticated, user, router]);
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<LoginCredentials>();
+
+  const onSubmit = async (data: LoginCredentials) => {
+    try {
+      console.log('Attempting login...');
+      const user = await login(data);
+
+      console.log('Login successful, user data:', user);
+
+      // Redirect based on user role
+      if (user) {
+        const redirectUrl = (user.is_admin || user.role === 'admin')
+          ? '/admin/dashboard'
+          : '/';
+
+        console.log('Redirecting to:', redirectUrl);
+
+        // Wait for state to update properly before redirecting
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Use router.push instead of window.location for smooth navigation
+        router.push(redirectUrl);
+      } else {
+        console.error('Login returned null/undefined user');
+      }
+    } catch (err) {
+      console.error('Login error:', err);
+      // Error is handled by store
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="text-center">
+        <CardTitle className="text-2xl">Welcome Back</CardTitle>
+        <CardDescription>Sign in to your account to continue</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          {error && (
+            <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+              {error}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <Label htmlFor="email">Email</Label>
+            <Input
+              id="email"
+              type="email"
+              placeholder="you@example.com"
+              {...register("email", {
+                required: "Email is required",
+                pattern: {
+                  value: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+                  message: "Invalid email address",
+                },
+                onChange: () => clearError(),
+              })}
+              error={!!errors.email}
+            />
+            {errors.email && (
+              <p className="text-xs text-destructive">{errors.email.message}</p>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <Label htmlFor="password">Password</Label>
+              <Link
+                href={ROUTES.forgotPassword || "/forgot-password"}
+                className="text-xs text-primary hover:underline"
+              >
+                Forgot password?
+              </Link>
+            </div>
+            <div className="relative">
+              <Input
+                id="password"
+                type={showPassword ? "text" : "password"}
+                placeholder="Enter your password"
+                {...register("password", {
+                  required: "Password is required",
+                  minLength: {
+                    value: 6,
+                    message: "Password must be at least 6 characters",
+                  },
+                  onChange: () => clearError(),
+                })}
+                error={!!errors.password}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="absolute right-1 top-1 h-8 w-8"
+                onClick={() => setShowPassword(!showPassword)}
+              >
+                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </Button>
+            </div>
+            {errors.password && (
+              <p className="text-xs text-destructive">{errors.password.message}</p>
+            )}
+          </div>
+
+          <Button type="submit" className="w-full" disabled={isLoading}>
+            {isLoading ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Signing in...
+              </>
+            ) : (
+              "Sign In"
+            )}
+          </Button>
+        </form>
+
+        <div className="relative my-6">
+          <Separator />
+          <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card px-2 text-xs text-muted-foreground">
+            OR
+          </span>
+        </div>
+
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full flex items-center justify-center gap-2"
+          onClick={() => {
+            const clientId = "433927974317-omujf5cn8ndhtdrofprnv9sb0uo3irl1.apps.googleusercontent.com";
+            // Use current host for redirect
+            const redirectUri = `${window.location.origin}/google/callback`;
+            const scope = "openid email profile";
+            const responseType = "id_token token";
+            const nonce = Math.random().toString(36).substring(7);
+
+            const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=${responseType}&scope=${scope}&nonce=${nonce}`;
+
+            window.location.href = authUrl;
+          }}
+        >
+          <img src="/images/icons/google.png" alt="Google" className="w-5 h-5" />
+          Continue with Google
+        </Button>
+
+        {googleError && (
+          <div className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+            {googleError}
+          </div>
+        )}
+      </CardContent>
+      <CardFooter className="justify-center">
+        <p className="text-sm text-muted-foreground">
+          Don&apos;t have an account?{" "}
+          <Link href={ROUTES.register} className="text-primary hover:underline">
+            Sign up
+          </Link>
+        </p>
+      </CardFooter>
+    </Card>
+  );
+}

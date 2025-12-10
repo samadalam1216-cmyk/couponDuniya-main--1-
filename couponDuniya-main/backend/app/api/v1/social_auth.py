@@ -1,0 +1,459 @@
+from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+import httpx
+import json
+import urllib.parse
+
+from ...database import get_db
+from ...models import User
+from ...models.social_account import SocialAccount
+from ...security import create_access_token, get_password_hash
+from ...config import get_settings
+from ...dependencies import get_current_user
+
+router = APIRouter(prefix="/auth/social", tags=["Social Authentication"])
+settings = get_settings()
+
+
+class GoogleLoginRequest(BaseModel):
+    token: str  # Google ID token
+
+
+class FacebookLoginRequest(BaseModel):
+    access_token: str
+
+
+class SocialLinkRequest(BaseModel):
+    provider: str
+    token: str
+
+
+async def verify_google_token(token: str) -> dict:
+    """Verify Google ID token and return user info"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={token}"
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Invalid Google token")
+
+        data = response.json()
+
+        return {
+            "provider_user_id": data.get("sub"),
+            "email": data.get("email"),
+            "name": data.get("name"),
+            "picture": data.get("picture"),
+            "email_verified": data.get("email_verified", False)
+        }
+
+
+async def verify_facebook_token(access_token: str) -> dict:
+    """Verify Facebook access token and return user info"""
+    async with httpx.AsyncClient() as client:
+        # Verify token
+        app_token = f"{settings.FACEBOOK_APP_ID}|{settings.FACEBOOK_APP_SECRET}"
+        verify_response = await client.get(
+            f"https://graph.facebook.com/debug_token",
+            params={
+                "input_token": access_token,
+                "access_token": app_token
+            }
+        )
+
+        if verify_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Invalid Facebook token")
+
+        verify_data = verify_response.json()
+        if not verify_data.get("data", {}).get("is_valid"):
+            raise HTTPException(status_code=400, detail="Invalid Facebook token")
+
+        # Get user info
+        user_response = await client.get(
+            "https://graph.facebook.com/me",
+            params={
+                "fields": "id,name,email,picture",
+                "access_token": access_token
+            }
+        )
+
+        if user_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to fetch Facebook user info")
+
+        data = user_response.json()
+
+        return {
+            "provider_user_id": data.get("id"),
+            "email": data.get("email"),
+            "name": data.get("name"),
+            "picture": data.get("picture", {}).get("data", {}).get("url"),
+            "email_verified": True  # Facebook emails are verified
+        }
+
+
+@router.post("/google", response_model=dict)
+async def login_with_google(
+    payload: GoogleLoginRequest,
+    db: Session = Depends(get_db)
+):
+    """Login or register with Google - Auto-registers new users"""
+    # Verify token and get user info
+    user_info = await verify_google_token(payload.token)
+
+    # Check if user with this email exists in the database
+    user = db.scalar(select(User).where(User.email == user_info["email"]))
+
+    if not user:
+        # Auto-register new user with Google account
+        email_verified = user_info.get("email_verified", False)
+        # Convert string 'true'/'false' to boolean if needed
+        if isinstance(email_verified, str):
+            email_verified = email_verified.lower() == 'true'
+        
+        # Split name into first and last name
+        full_name = user_info.get("name", "")
+        name_parts = full_name.split(' ', 1) if full_name else ['', '']
+        first_name = name_parts[0] if len(name_parts) > 0 else ''
+        last_name = name_parts[1] if len(name_parts) > 1 else ''
+        
+        user = User(
+            email=user_info["email"],
+            full_name=full_name or f"{first_name} {last_name}".strip(),
+            password_hash=None,  # No password for social login - prevents password auth
+            is_verified=bool(email_verified),
+            email_verified_at=datetime.utcnow() if email_verified else None,
+            role="customer",
+            is_admin=False,
+            auth_provider="google",
+            avatar_url=user_info.get("picture"),  # Store Google profile picture
+        )
+        db.add(user)
+        db.flush()
+
+    # Check if Google account is already linked
+    social_account = db.scalar(
+        select(SocialAccount).where(
+            SocialAccount.provider == "google",
+            SocialAccount.provider_user_id == user_info["provider_user_id"]
+        )
+    )
+
+    if social_account:
+        # Update existing social account
+        social_account.profile_data = json.dumps(user_info)
+        social_account.updated_at = datetime.utcnow()
+        
+        # Update user's profile picture if changed
+        if user_info.get("picture") and user.avatar_url != user_info.get("picture"):
+            user.avatar_url = user_info.get("picture")
+        
+        db.commit()
+    else:
+        # Link Google account to user
+        social_account = SocialAccount(
+            user_id=user.id,
+            provider="google",
+            provider_user_id=user_info["provider_user_id"],
+            profile_data=json.dumps(user_info)
+        )
+        db.add(social_account)
+        db.commit()
+
+    db.refresh(user)
+
+    # Generate access token
+    access_token = create_access_token(str(user.id))
+
+    # Split full_name for response
+    name_parts = (user.full_name or "").split(' ', 1)
+    first_name = name_parts[0] if len(name_parts) > 0 else ''
+    last_name = name_parts[1] if len(name_parts) > 1 else ''
+
+    return {
+        "success": True,
+        "message": "Logged in successfully with Google",
+        "data": {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "uuid": str(user.uuid),
+                "email": user.email,
+                "mobile": user.mobile,
+                "full_name": user.full_name,
+                "first_name": first_name,
+                "last_name": last_name,
+                "avatar_url": user.avatar_url,
+                "wallet_balance": float(user.wallet_balance or 0),
+                "pending_cashback": float(user.pending_cashback or 0),
+                "referral_code": user.referral_code,
+                "role": user.role,
+                "is_admin": user.is_admin,
+                "is_verified": user.is_verified,
+                "auth_provider": user.auth_provider,
+                "password_hash": user.password_hash is not None
+            }
+        }
+    }
+
+
+@router.post("/facebook", response_model=dict)
+async def login_with_facebook(
+    payload: FacebookLoginRequest,
+    db: Session = Depends(get_db)
+):
+    """Login or register with Facebook"""
+
+    # Verify token and get user info
+    user_info = await verify_facebook_token(payload.access_token)
+
+    if not user_info.get("email"):
+        raise HTTPException(status_code=400, detail="Email permission required")
+
+    # Check if social account exists
+    social_account = db.scalar(
+        select(SocialAccount).where(
+            SocialAccount.provider == "facebook",
+            SocialAccount.provider_user_id == user_info["provider_user_id"]
+        )
+    )
+
+    if social_account:
+        # Existing user - login
+        user = social_account.user
+
+        # Update social account
+        social_account.access_token = payload.access_token
+        social_account.profile_data = json.dumps(user_info)
+        social_account.updated_at = datetime.utcnow()
+        db.commit()
+
+    else:
+        # Check if user with this email exists
+        user = db.scalar(select(User).where(User.email == user_info["email"]))
+
+        if user:
+            # Link existing account
+            social_account = SocialAccount(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id=user_info["provider_user_id"],
+                access_token=payload.access_token,
+                profile_data=json.dumps(user_info)
+            )
+            db.add(social_account)
+        else:
+            # Create new user
+            user = User(
+                email=user_info["email"],
+                full_name=user_info["name"],
+                password_hash=None,  # No password for social login - prevents password auth
+                is_verified=user_info["email_verified"],
+                email_verified_at=datetime.utcnow() if user_info["email_verified"] else None,
+                auth_provider="facebook",
+                role="customer",
+            )
+            db.add(user)
+            db.flush()
+
+            # Create social account
+            social_account = SocialAccount(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id=user_info["provider_user_id"],
+                access_token=payload.access_token,
+                profile_data=json.dumps(user_info)
+            )
+            db.add(social_account)
+
+        db.commit()
+        db.refresh(user)
+
+    # Generate access token
+    access_token = create_access_token(str(user.id))
+
+    return {
+        "success": True,
+        "message": "Logged in successfully with Facebook",
+        "data": {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "full_name": user.full_name,
+                "is_admin": user.is_admin,
+                "role": user.role
+            }
+        }
+    }
+
+
+@router.get("/accounts", response_model=dict)
+def get_linked_accounts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all linked social accounts"""
+    accounts = db.scalars(
+        select(SocialAccount).where(SocialAccount.user_id == current_user.id)
+    ).all()
+
+    return {
+        "success": True,
+        "data": {
+            "accounts": [
+                {
+                    "provider": acc.provider,
+                    "provider_user_id": acc.provider_user_id,
+                    "created_at": acc.created_at.isoformat(),
+                    "updated_at": acc.updated_at.isoformat()
+                }
+                for acc in accounts
+            ]
+        }
+    }
+
+
+@router.delete("/unlink/{provider}", response_model=dict)
+def unlink_social_account(
+    provider: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Unlink a social account"""
+    account = db.scalar(
+        select(SocialAccount).where(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.provider == provider
+        )
+    )
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
+
+    db.delete(account)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": f"{provider.capitalize()} account unlinked successfully"
+    }
+
+
+@router.get("/google/login")
+async def google_login_redirect():
+    """Redirect to Google OAuth consent screen"""
+    google_auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "consent"
+    }
+    url = f"{google_auth_url}?{urllib.parse.urlencode(params)}"
+    return RedirectResponse(url=url)
+
+
+@router.get("/google/callback")
+async def google_callback(
+    code: str = None,
+    error: str = None,
+    db: Session = Depends(get_db)
+):
+    """Handle Google OAuth callback"""
+    if error:
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5000')
+        return RedirectResponse(url=f"{frontend_url}/login?error={error}")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="No authorization code provided")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code"
+                }
+            )
+
+            if token_response.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to exchange code for token")
+
+            tokens = token_response.json()
+            id_token = tokens.get("id_token")
+
+            if not id_token:
+                raise HTTPException(status_code=400, detail="No ID token in response")
+
+            user_info = await verify_google_token(id_token)
+
+            user = db.scalar(select(User).where(User.email == user_info["email"]))
+
+            if not user:
+                # Auto-register new user with Google account
+                email_verified = user_info.get("email_verified", False)
+                # Convert string 'true'/'false' to boolean if needed
+                if isinstance(email_verified, str):
+                    email_verified = email_verified.lower() == 'true'
+                
+                user = User(
+                    email=user_info["email"],
+                    full_name=user_info.get("name", ""),
+                    password_hash=None,  # No password for social login - prevents password auth
+                    is_verified=bool(email_verified),
+                    email_verified_at=datetime.utcnow() if email_verified else None,
+                    role="customer",
+                    is_admin=False,
+                    auth_provider="google",
+                    avatar_url=user_info.get("picture"),  # Store Google profile picture
+                )
+                db.add(user)
+                db.flush()
+
+            social_account = db.scalar(
+                select(SocialAccount).where(
+                    SocialAccount.provider == "google",
+                    SocialAccount.provider_user_id == user_info["provider_user_id"]
+                )
+            )
+
+            if social_account:
+                social_account.profile_data = json.dumps(user_info)
+                social_account.updated_at = datetime.utcnow()
+                db.commit()
+            else:
+                social_account = SocialAccount(
+                    user_id=user.id,
+                    provider="google",
+                    provider_user_id=user_info["provider_user_id"],
+                    profile_data=json.dumps(user_info)
+                )
+                db.add(social_account)
+                db.commit()
+
+            db.refresh(user)
+            access_token = create_access_token(str(user.id))
+
+            frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5000')
+            return RedirectResponse(
+                url=f"{frontend_url}/google/callback#id_token={access_token}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5000')
+        return RedirectResponse(url=f"{frontend_url}/login?error=auth_failed")

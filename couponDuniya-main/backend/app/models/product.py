@@ -1,0 +1,25 @@
+from sqlalchemy import String, Boolean, DateTime, ForeignKey, Integer, Numeric, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from datetime import datetime
+from ..database import Base
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    merchant_id: Mapped[int] = mapped_column(ForeignKey("merchants.id"), index=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    slug: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(String(500))
+    price: Mapped[float] = mapped_column(Numeric(10,2))
+    stock: Mapped[int] = mapped_column(Integer, default=0)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), index=True)
+    is_bestseller: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    variants = relationship("ProductVariant", back_populates="product")
+
+    merchant = relationship("Merchant")
+    category = relationship("Category")

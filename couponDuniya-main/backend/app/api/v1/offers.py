@@ -1,0 +1,209 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import select, func
+from pydantic import BaseModel
+from ...database import get_db
+from ...models import Offer, Merchant, User
+from ...schemas import OfferRead
+from ...redis_client import cache_get, cache_set, cache_invalidate_prefix, rk
+from ...dependencies import rate_limit_dependency, get_current_user
+import json, hashlib
+
+router = APIRouter(prefix="/offers", tags=["Offers"])
+
+class OfferFilters(BaseModel):
+    page: int = 1
+    limit: int = 20
+    merchant_id: int | None = None
+    search: str | None = None
+
+
+@router.get("/")
+def list_offers(
+    page: int = 1,
+    limit: int = 20,
+    merchant_id: int | None = None,
+    category_id: int | None = None,
+    search: str | None = None,
+    sort_by: str | None = None,
+    is_exclusive: bool | None = None,
+    is_verified: bool | None = None,
+    has_cashback: bool | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _: dict = Depends(rate_limit_dependency("offers:list", limit=100, window_seconds=60))
+):
+    """List all offers with filtering and pagination"""
+    cache_key = rk(
+        "cache",
+        "offers",
+        hashlib.md5(
+            json.dumps(
+                {"page": page, "limit": limit, "merchant_id": merchant_id, "category_id": category_id, 
+                 "search": search, "sort_by": sort_by, "is_exclusive": is_exclusive},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
+    )
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    query = select(Offer, Merchant).join(Merchant).where(Offer.is_active == True)
+
+    if merchant_id:
+        query = query.where(Offer.merchant_id == merchant_id)
+    if is_exclusive:
+        query = query.where(Offer.is_exclusive == True)
+    if search:
+        query = query.where(Offer.title.ilike(f"%{search}%"))
+
+    # Apply sorting
+    if sort_by == "newest":
+        query = query.order_by(Offer.created_at.desc())
+    elif sort_by == "popular":
+        query = query.order_by(Offer.priority.desc())
+    elif sort_by == "expiring_soon":
+        query = query.where(Offer.end_date.isnot(None)).order_by(Offer.end_date.asc())
+    else:
+        query = query.order_by(Offer.priority.desc(), Offer.created_at.desc())
+
+    # Count total
+    count_query = select(func.count()).select_from(Offer).where(Offer.is_active == True)
+    if merchant_id:
+        count_query = count_query.where(Offer.merchant_id == merchant_id)
+    if search:
+        count_query = count_query.where(Offer.title.ilike(f"%{search}%"))
+
+    total = db.scalar(count_query)
+
+    # Paginate
+    offset = (page - 1) * limit
+    results = db.execute(query.offset(offset).limit(limit)).all()
+
+    # Format response
+    offers = []
+    for offer, merchant in results:
+        offers.append({
+            "id": offer.id,
+            "title": offer.title,
+            "code": offer.code,
+            "image_url": offer.image_url,
+            "merchant_id": offer.merchant_id,
+            "is_active": offer.is_active,
+            "priority": offer.priority,
+            "start_date": offer.start_date.isoformat() if offer.start_date else None,
+            "end_date": offer.end_date.isoformat() if offer.end_date else None,
+            "created_at": offer.created_at.isoformat(),
+            "merchant": {
+                "id": merchant.id,
+                "name": merchant.name,
+                "slug": merchant.slug,
+                "logo_url": merchant.logo_url
+            }
+        })
+
+    total_count = total or 0
+    response = {
+        "success": True,
+        "data": offers,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_count,
+            "pages": (total_count + limit - 1) // limit if total_count else 0
+        }
+    }
+    cache_set(cache_key, response, 300)
+    return response
+
+
+@router.get("/featured")
+def featured_offers(limit: int = 12, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return a list of 'featured' offers (highest priority first)."""
+    query = (
+        select(Offer, Merchant)
+        .join(Merchant)
+        .where(Offer.is_active == True)
+        .order_by(Offer.priority.desc(), Offer.created_at.desc())
+        .limit(limit)
+    )
+    results = db.execute(query).all()
+    data = [
+        {
+            "id": o.id,
+            "title": o.title,
+            "code": o.code,
+            "image_url": o.image_url,
+            "merchant_id": o.merchant_id,
+            "priority": o.priority,
+            "created_at": o.created_at.isoformat(),
+            "merchant": {"id": m.id, "name": m.name, "slug": m.slug, "logo_url": m.logo_url},
+        }
+        for o, m in results
+    ]
+    return {"success": True, "data": data}
+
+
+@router.get("/exclusive")
+def exclusive_offers(limit: int = 12, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return a list of 'exclusive' offers approximated by priority > 0."""
+    query = (
+        select(Offer, Merchant)
+        .join(Merchant)
+        .where(Offer.is_active == True, Offer.priority > 0)
+        .order_by(Offer.priority.desc(), Offer.created_at.desc())
+        .limit(limit)
+    )
+    results = db.execute(query).all()
+    data = [
+        {
+            "id": o.id,
+            "title": o.title,
+            "code": o.code,
+            "image_url": o.image_url,
+            "merchant_id": o.merchant_id,
+            "priority": o.priority,
+            "created_at": o.created_at.isoformat(),
+            "merchant": {"id": m.id, "name": m.name, "slug": m.slug, "logo_url": m.logo_url},
+        }
+        for o, m in results
+    ]
+    return {"success": True, "data": data}
+
+
+@router.get("/{offer_id}")
+def get_offer(offer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Get single offer by ID"""
+    result = db.execute(
+        select(Offer, Merchant)
+        .join(Merchant)
+        .where(Offer.id == offer_id)
+    ).first()
+
+    if not result:
+        return {"success": False, "error": "Offer not found"}
+
+    offer, merchant = result
+    return {
+        "success": True,
+        "data": {
+            "id": offer.id,
+            "title": offer.title,
+            "code": offer.code,
+            "image_url": offer.image_url,
+            "merchant_id": offer.merchant_id,
+            "is_active": offer.is_active,
+            "priority": offer.priority,
+            "start_date": offer.start_date.isoformat() if offer.start_date else None,
+            "end_date": offer.end_date.isoformat() if offer.end_date else None,
+            "created_at": offer.created_at.isoformat(),
+            "merchant": {
+                "id": merchant.id,
+                "name": merchant.name,
+                "slug": merchant.slug,
+                "description": merchant.description,
+                "logo_url": merchant.logo_url
+            }
+        }
+    }
